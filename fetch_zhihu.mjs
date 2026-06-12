@@ -1,35 +1,39 @@
-// Zhihu Data Archival Script — fetches answers (with full content), pins, and articles
-// via the Zhihu public API v4 /members/{token} endpoints.
+#!/usr/bin/env node
+// Zhihu Data Archival Tool v2.0.0 — Rich content preservation
 //
 // Usage:
 //   node fetch_zhihu.mjs --token=<url_token> [--cookie="..."] [flags]
 //
 //   --token=<url_token>      (Required) Target user's Zhihu url_token
-//   --cookie="..."           Cookie header string for auth, or reads from zhihu_cookie_header.txt
+//   --cookie="..."           Cookie header string for auth
 //   --skip-answers           Skip answers fetch
 //   --skip-pins              Skip pins fetch
 //   --skip-articles          Skip articles fetch
-//
-// Authentication: A logged-in Zhihu cookie is required. The cookie is read from
-// zhihu_cookie_header.txt in the working directory, or passed via --cookie=.
-// Without it, the API returns limited results.
-//
-// Output files (saved in current working directory):
-//   zhihu_complete.json      — all answers with full content
-//   zhihu_pins_all.json      — all pins / 想法
-//   zhihu_articles_all.json  — all articles / 专栏
-//   zhihu_archive_summary.md — statistics summary
-//
-// Checkpoints are saved periodically so partial runs are not wasted.
+//   --no-images              Skip image download (keep URLs)
+//   --no-markdown            Skip Markdown generation (JSON only)
+//   --no-enrich              Skip HTML page scraping for details/topics/columns
+//   --out-dir=<path>         Output directory (default: .)
+//   --concurrency=<n>        Image download concurrency (default: 5)
 
 import fs from 'fs';
-
-// ─── Config ───────────────────────────────────────────────────────────────────
-const PER_PAGE = 20;
-const REQUEST_DELAY = 1500;      // ms between pages
-const MAX_RETRIES = 5;
-const CKPT_INTERVAL = 100;       // checkpoint save every N new items
-const OUT_DIR = process.cwd();
+import {
+  OUT_DIR, API, CKPT_INTERVAL,
+} from './lib/constants.mjs';
+import {
+  sleep, loadJSON, saveJSON, fetchProfile, fetchAllPages,
+} from './lib/fetcher.mjs';
+import {
+  getAnswersInclude, extractAnswer, mergeAnswer,
+} from './lib/extractors/answers.mjs';
+import {
+  getPinsInclude, extractPin,
+} from './lib/extractors/pins.mjs';
+import {
+  getArticlesInclude, extractArticle, mergeArticle,
+} from './lib/extractors/articles.mjs';
+import { downloadImages } from './lib/media.mjs';
+import { exportMarkdown } from './lib/exporter.mjs';
+import { enrichQuestion, enrichArticle } from './lib/enricher.mjs';
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 function getArg(flag) {
@@ -46,10 +50,15 @@ if (!USER_TOKEN) {
 }
 
 const SKIP = {
-  answers: process.argv.includes('--skip-answers'),
-  pins: process.argv.includes('--skip-pins'),
+  answers:  process.argv.includes('--skip-answers'),
+  pins:     process.argv.includes('--skip-pins'),
   articles: process.argv.includes('--skip-articles'),
 };
+const NO_IMAGES   = process.argv.includes('--no-images');
+const NO_MARKDOWN = process.argv.includes('--no-markdown');
+const NO_ENRICH   = process.argv.includes('--no-enrich');
+const OUT_DIR_CLI = getArg('--out-dir=') || OUT_DIR;
+const CONCURRENCY = parseInt(getArg('--concurrency=') || '5', 10);
 
 // ─── Cookie ───────────────────────────────────────────────────────────────────
 function getCookie() {
@@ -63,219 +72,139 @@ function getCookie() {
   }
 }
 
-function makeHeaders(cookie) {
-  return {
-    'Cookie': cookie,
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-                  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    'Referer': `https://www.zhihu.com/people/${USER_TOKEN}/`,
-    'x-requested-with': 'XMLHttpRequest',
-  };
-}
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function buildCrossReferences(answers, pins, articles) {
+  const refs = { questions: {}, topic_index: {}, pin_reposts: {} };
 
-// ─── Utilities ────────────────────────────────────────────────────────────────
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-
-function loadJSON(file) {
-  const path = `${OUT_DIR}/${file}`;
-  try { return JSON.parse(fs.readFileSync(path, 'utf8')); } catch { return null; }
-}
-
-function saveJSON(file, data) {
-  const path = `${OUT_DIR}/${file}`;
-  fs.writeFileSync(path, JSON.stringify(data, null, 2), 'utf8');
-  console.log(`  ✓ Saved ${path}`);
-}
-
-// ─── Rate-limited fetch with retry ────────────────────────────────────────────
-async function fetchJSON(url, headers, retries = MAX_RETRIES) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const resp = await fetch(url, { headers, redirect: 'manual' });
-      const text = await resp.text();
-
-      if (text.trim().startsWith('<')) {
-        const titleMatch = text.match(/<title>([^<]+)<\/title>/);
-        const title = titleMatch ? titleMatch[1] : 'HTML page';
-        if (resp.status === 403 || resp.status === 429) {
-          const wait = 30000;
-          console.warn(`  ⚠ 403/429 — rate limited, waiting ${wait/1000}s...`);
-          await sleep(wait);
-          continue;
-        }
-        if (resp.status === 500) {
-          throw Object.assign(new Error(`Server error (500)`), { status: 500, isServerError: true });
-        }
-        throw new Error(`HTML response (${resp.status}): ${title}`);
+  // Questions → answers
+  if (answers?.answers) {
+    for (const a of answers.answers) {
+      const qid = a.question?.id;
+      if (!qid) continue;
+      if (!refs.questions[qid]) {
+        refs.questions[qid] = {
+          id: qid,
+          title: a.question.title || '',
+          answered_by: [],
+          topics: a.question.topics || [],
+        };
       }
+      refs.questions[qid].answered_by.push(a.id);
 
-      const data = JSON.parse(text);
-      if (data.error) {
-        if (data.error.code === 40362) {
-          const wait = 30000;
-          console.warn(`  ⚠ Rate limited, waiting ${wait/1000}s...`);
-          await sleep(wait);
-          continue;
-        }
-        throw new Error(`API error: ${data.error.message}`);
+      // Topic index
+      for (const t of (a.question.topics || [])) {
+        if (!refs.topic_index[t.id]) refs.topic_index[t.id] = { name: t.name, answers: [], articles: [], pins: [] };
+        if (!refs.topic_index[t.id].answers.includes(a.id)) refs.topic_index[t.id].answers.push(a.id);
       }
-      return data;
-    } catch (e) {
-      if (e.isServerError || e.status === 500) throw e;
-      if (e.message?.includes('HTML') && e.message.includes('(500)')) throw e;
-      if (attempt === retries) throw e;
-      const wait = 5000 * Math.pow(2, attempt);
-      console.warn(`  ⚠ ${e.message}, retry ${attempt+1}/${retries} in ${wait/1000}s...`);
-      await sleep(wait);
     }
   }
-}
 
-// ─── Profile ──────────────────────────────────────────────────────────────────
-async function fetchProfile(headers) {
-  return fetchJSON(
-    `https://www.zhihu.com/api/v4/members/${USER_TOKEN}?include=name,url_token,answer_count,pins_count,articles_count,followers_count,headline`,
-    headers
-  );
-}
-
-// ─── Paginated fetch with checkpoint saves ────────────────────────────────────
-async function fetchAllPages(endpoint, headers, opts = {}) {
-  const { include, existingSet, makeItem, mergeItem } = opts;
-  const allItems = [];
-  let offset = 0;
-  let currentPage = 0;
-
-  for (; ; currentPage++) {
-    let url = `https://www.zhihu.com/api/v4/members/${USER_TOKEN}${endpoint}?limit=${PER_PAGE}&offset=${offset}`;
-    if (include) url += `&include=${encodeURIComponent(include)}`;
-
-    let data;
-    try {
-      data = await fetchJSON(url, headers);
-    } catch (e) {
-      if (e.isServerError) {
-        console.warn(`\n  ⚠ Stopped due to server error at offset=${offset}`);
-        break;
+  // Articles → topic index
+  if (articles?.length) {
+    for (const a of articles) {
+      for (const t of (a.topics || [])) {
+        if (!refs.topic_index[t.id]) refs.topic_index[t.id] = { name: t.name, answers: [], articles: [], pins: [] };
+        if (!refs.topic_index[t.id].articles.includes(a.id)) refs.topic_index[t.id].articles.push(a.id);
       }
-      throw e;
     }
-
-    const items = data.data || [];
-    if (items.length === 0) break;
-
-    let addedThisPage = 0;
-    for (const item of items) {
-      const key = makeKey(item);
-      if (existingSet && existingSet.has(key)) {
-        if (mergeItem) mergeItem(key, item);
-        continue;
-      }
-      const parsed = makeItem ? makeItem(item) : item;
-      allItems.push(parsed);
-      if (existingSet) existingSet.add(key);
-      addedThisPage++;
-    }
-
-    const total = data.paging?.totals || '?';
-    process.stdout.write(`\r  Page ${currentPage + 1}: +${allItems.length} new (total: ${total})`);
-
-    // Checkpoint save
-    if (allItems.length > 0 && allItems.length % CKPT_INTERVAL === 0) {
-      console.log(`\n  [Checkpoint: ${allItems.length} items]`);
-      if (opts.onCheckpoint) opts.onCheckpoint(allItems);
-    }
-
-    if (data.paging?.is_end || items.length < PER_PAGE) break;
-    offset += PER_PAGE;
-    await sleep(REQUEST_DELAY);
   }
 
-  console.log(`\n  Total new items fetched: ${allItems.length}`);
-  return allItems;
+  // Pin repost chains
+  if (pins?.length) {
+    for (const p of pins) {
+      if (p.origin_pin?.url) {
+        const originId = p.origin_pin.url.split('/').pop();
+        if (!refs.pin_reposts[originId]) refs.pin_reposts[originId] = [];
+        refs.pin_reposts[originId].push(p.id);
+      }
+      if (p.repin?.url) {
+        const repinId = p.repin.url.split('/').pop();
+        if (!refs.pin_reposts[repinId]) refs.pin_reposts[repinId] = [];
+        refs.pin_reposts[repinId].push(p.id);
+      }
+    }
+  }
+
+  return refs;
 }
 
-function makeKey(item) {
-  return String(item.id || item.url || '');
-}
-
-// ─── ANSWERS ──────────────────────────────────────────────────────────────────
-async function fetchAllAnswers(headers) {
+// ─── Answers ──────────────────────────────────────────────────────────────────
+async function fetchAnswers(cookie) {
   console.log('\n═══════════════════════════════════════');
   console.log('   FETCHING ANSWERS');
   console.log('═══════════════════════════════════════');
 
   const existing = loadJSON('zhihu_complete.json');
   const existingMap = new Map();
-  for (const a of (existing?.answers || [])) existingMap.set(String(a.id), a);
-  console.log(`Existing: ${existingMap.size} answers (${existing?.answers?.filter?.(a => a.content)?.length || 0} with content)`);
+  for (const a of (existing?.answers || [])) existingMap.set(a.id, a);
+  console.log(`Existing: ${existingMap.size} answers (${[...existingMap.values()].filter(a => a.content_html).length} with content)`);
 
   const existingIds = new Set(existingMap.keys());
-
-  const include = [
-    'data[*].content', 'data[*].excerpt',
-    'data[*].voteup_count', 'data[*].comment_count',
-    'data[*].collect_count', 'data[*].favorite_count',
-    'data[*].created_time', 'data[*].updated_time',
-    'data[*].question.title', 'data[*].question.question_type',
-    'data[*].url',
-  ].join(',');
-
   let upgradedCount = 0;
 
-  const newItems = await fetchAllPages('/answers', headers, {
-    include,
+  const newItems = await fetchAllPages('ANSWERS', USER_TOKEN, cookie, {
+    include: getAnswersInclude(),
     existingSet: existingIds,
-    makeItem: item => ({
-      id: String(item.id),
-      question: item.question?.title || '',
-      votes: item.voteup_count ?? 0,
-      comments: item.comment_count ?? 0,
-      collects: item.collect_count ?? item.favorite_count ?? 0,
-      created: new Date((item.created_time || 0) * 1000).toISOString(),
-      excerpt: item.excerpt || '',
-      content: item.content || '',
-    }),
+    makeItem: extractAnswer,
     mergeItem: (id, item) => {
       const entry = existingMap.get(id);
-      if (!entry) return;
-      let changed = false;
-      if (!entry.content && item.content) {
-        entry.content = item.content; changed = true;
-      }
-      if (!entry.excerpt && item.excerpt) {
-        entry.excerpt = item.excerpt; changed = true;
-      }
-      if (item.voteup_count !== undefined && item.voteup_count > (entry.votes || 0)) {
-        entry.votes = item.voteup_count; changed = true;
-      }
-      if (item.comment_count !== undefined && item.comment_count > (entry.comments || 0)) {
-        entry.comments = item.comment_count; changed = true;
-      }
-      if (changed) upgradedCount++;
+      if (entry && mergeAnswer(entry, item)) upgradedCount++;
     },
-    onCheckpoint: (allNew) => {
-      saveCheckpointAnswers(existingMap, allNew);
+    onCheckpoint: (items) => {
+      const merged = new Map(existingMap);
+      for (const a of items) merged.set(a.id, a);
+      finalizeAnswers(merged, 0);
     },
   });
 
-  // Merge new into map
   for (const a of newItems) {
-    const id = String(a.id);
-    if (!existingMap.has(id)) {
-      existingMap.set(id, a);
+    if (!existingMap.has(a.id)) existingMap.set(a.id, a);
+  }
+
+  console.log(`  New this run: ${newItems.length}, upgraded: ${upgradedCount}`);
+
+  // Enrich questions
+  if (!NO_ENRICH) {
+    console.log('\nEnriching question details (HTML page scrape)...');
+    const allAnswers = [...existingMap.values()];
+    const questionsToEnrich = [...new Set(allAnswers.filter(a => !a.question.detail).map(a => a.question.id))];
+    let enriched = 0;
+    for (let i = 0; i < questionsToEnrich.length; i++) {
+      const qid = questionsToEnrich[i];
+      const data = await enrichQuestion(qid, cookie, USER_TOKEN);
+      if (data.detail || data.topics.length > 0) {
+        for (const a of existingMap.values()) {
+          if (a.question.id === qid) {
+            a.question.detail = data.detail || '';
+            a.question.detail_text = data.detail_text || '';
+            a.question.topics = data.topics;
+          }
+        }
+        enriched++;
+        process.stdout.write(`\r  Enriched ${enriched}/${i + 1} questions`);
+      }
+      if (i < questionsToEnrich.length - 1) await sleep(500); // polite delay
     }
+    console.log(`\n  Enriched ${enriched}/${questionsToEnrich.length} questions`);
+  }
+
+  // Download images
+  if (!NO_IMAGES) {
+    console.log('\nDownloading answer images...');
+    let imgCount = 0, total = 0;
+    for (const a of existingMap.values()) {
+      if (a.content_html) {
+        total++;
+        const result = await downloadImages(a.content_html, a.id, 'answer', OUT_DIR_CLI, CONCURRENCY);
+        a.content_html = result.html;
+        a.images = result.manifest;
+        imgCount += result.manifest.filter(m => !m.failed).length;
+      }
+    }
+    console.log(`  Downloaded ${imgCount} images for ${total} answers`);
   }
 
   return finalizeAnswers(existingMap, upgradedCount);
-}
-
-function saveCheckpointAnswers(existingMap, newItems) {
-  const merged = new Map(existingMap);
-  for (const a of newItems) merged.set(String(a.id), a);
-  finalizeAnswers(merged, 0);
 }
 
 function finalizeAnswers(answerMap, upgradedCount) {
@@ -287,66 +216,31 @@ function finalizeAnswers(answerMap, upgradedCount) {
     const y = new Date(a.created || 0).getFullYear();
     if (y > 2000) years[y] = (years[y] || 0) + 1;
   }
-  const totalVotes = answers.reduce((s, a) => s + (a.votes || 0), 0);
-  const withContent = answers.filter(a => a.content).length;
+  const totalVotes = answers.reduce((s, a) => s + (a.voteup_count || 0), 0);
+  const withContent = answers.filter(a => a.content_html).length;
 
   const result = { total: answers.length, total_votes: totalVotes, years, answers };
   saveJSON('zhihu_complete.json', result);
   const yStr = Object.entries(years).sort(([a],[b])=>a-b).map(([y,c])=>`${y}:${c}`).join(', ');
   console.log(`Answers done: ${answers.length} total (${withContent} with content) [${yStr}]`);
-  if (upgradedCount) console.log(`  (${upgradedCount} existing entries upgraded with content)`);
+  if (upgradedCount) console.log(`  (${upgradedCount} existing entries upgraded)`);
   return result;
 }
 
-// ─── PINS ─────────────────────────────────────────────────────────────────────
-function pinDateStr(pin) {
-  return pin.created ? new Date(pin.created * 1000).toISOString().split('T')[0] : '';
-}
-
-function extractPinText(content) {
-  if (!content || !Array.isArray(content)) return '';
-  return content
-    .filter(c => c.type === 'text')
-    .map(c => c.content || c.own_text || '')
-    .join('\n')
-    .replace(/<br\s*\/?>/g, '\n')
-    .replace(/<[^>]+>/g, '');
-}
-
-function extractPinMedia(content, type) {
-  if (!content || !Array.isArray(content)) return [];
-  return content.filter(c => c.type === type).map(c => c.content?.url || '').filter(Boolean);
-}
-
-async function fetchAllPins(headers) {
+// ─── Pins ─────────────────────────────────────────────────────────────────────
+async function fetchPins(cookie) {
   console.log('\n═══════════════════════════════════════');
   console.log('   FETCHING PINS (想法)');
   console.log('═══════════════════════════════════════');
 
   const existing = loadJSON('zhihu_pins_all.json') || [];
   console.log(`Existing: ${existing.length} pins`);
-
   const existingUrls = new Set(existing.filter(p => p.url).map(p => p.url));
 
-  const include = [
-    'data[*].content', 'data[*].excerpt', 'data[*].excerpt_title',
-    'data[*].created', 'data[*].updated',
-    'data[*].comment_count', 'data[*].like_count',
-    'data[*].url', 'data[*].source_pin_id',
-  ].join(',');
-
-  const newPins = await fetchAllPages('/pins', headers, {
-    include,
+  const newPins = await fetchAllPages('PINS', USER_TOKEN, cookie, {
+    include: getPinsInclude(),
     existingSet: null,
-    makeItem: item => ({
-      date: pinDateStr(item),
-      text: extractPinText(item.content),
-      images: extractPinMedia(item.content, 'image'),
-      links: extractPinMedia(item.content, 'link'),
-      comment_count: item.comment_count || 0,
-      like_count: item.like_count || 0,
-      url: item.url || '',
-    }),
+    makeItem: extractPin,
   });
 
   // Merge
@@ -354,16 +248,39 @@ async function fetchAllPins(headers) {
   for (const p of existing) pinMap.set(p.url, p);
   for (const p of newPins) { if (p.url) pinMap.set(p.url, p); }
 
-  const allPins = [...pinMap.values()].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-  const newCount = allPins.filter(p => !existingUrls.has(p.url)).length;
+  const allPins = [...pinMap.values()].sort((a, b) => (b.created || '').localeCompare(a.created || ''));
 
+  // Download images
+  if (!NO_IMAGES) {
+    console.log('\nDownloading pin images...');
+    let imgCount = 0;
+    for (const p of allPins) {
+      if (p.content_html) {
+        const result = await downloadImages(p.content_html, p.id, 'pin', OUT_DIR_CLI, CONCURRENCY);
+        p.content_html = result.html;
+        p.images = result.manifest;
+        imgCount += result.manifest.filter(m => !m.failed).length;
+      }
+      // Also download images in repin/origin_pin chains
+      for (const key of ['repin', 'origin_pin']) {
+        if (p[key]?.content_html) {
+          const result = await downloadImages(p[key].content_html, `${p.id}_${key}`, 'pin', OUT_DIR_CLI, CONCURRENCY);
+          p[key].content_html = result.html;
+        }
+      }
+    }
+    console.log(`  Downloaded ${imgCount} images for ${allPins.length} pins`);
+  }
+
+  const withText = allPins.filter(p => p.content_html).length;
+  const newCount = allPins.filter(p => !existingUrls.has(p.url)).length;
   saveJSON('zhihu_pins_all.json', allPins);
-  console.log(`Pins done: ${allPins.length} total (+${newCount} new, ${allPins.filter(p => p.text).length} with text)`);
+  console.log(`Pins done: ${allPins.length} total (+${newCount} new, ${withText} with content)`);
   return allPins;
 }
 
-// ─── ARTICLES ─────────────────────────────────────────────────────────────────
-async function fetchAllArticles(headers) {
+// ─── Articles ─────────────────────────────────────────────────────────────────
+async function fetchArticles(cookie) {
   console.log('\n═══════════════════════════════════════');
   console.log('   FETCHING ARTICLES');
   console.log('═══════════════════════════════════════');
@@ -371,143 +288,172 @@ async function fetchAllArticles(headers) {
   const existing = loadJSON('zhihu_articles_all.json') || [];
   console.log(`Existing: ${existing.length} articles`);
   const existingIds = new Set(existing.filter(a => a.id).map(a => String(a.id)));
-
-  const include = [
-    'data[*].title', 'data[*].content', 'data[*].excerpt',
-    'data[*].created', 'data[*].updated',
-    'data[*].url', 'data[*].voteup_count',
-    'data[*].comment_count', 'data[*].image_url',
-  ].join(',');
-
   let upgradedCount = 0;
 
-  const newArts = await fetchAllPages('/articles', headers, {
-    include,
+  const newArts = await fetchAllPages('ARTICLES', USER_TOKEN, cookie, {
+    include: getArticlesInclude(),
     existingSet: existingIds,
-    makeItem: item => ({
-      id: item.id,
-      title: item.title || '',
-      excerpt: item.excerpt || '',
-      content: item.content || '',
-      created: item.created ? new Date(item.created * 1000).toISOString() : '',
-      updated: item.updated ? new Date(item.updated * 1000).toISOString() : '',
-      url: item.url || '',
-      voteup_count: item.voteup_count || 0,
-      comment_count: item.comment_count || 0,
-      image_url: item.image_url || '',
-    }),
+    makeItem: extractArticle,
     mergeItem: (id, item) => {
       const entry = existing.find(a => String(a.id) === id);
-      if (entry && !entry.content && item.content) {
-        entry.content = item.content;
-        upgradedCount++;
-      }
+      if (entry && mergeArticle(entry, item)) upgradedCount++;
     },
   });
 
   // Merge
   const artMap = new Map();
-  for (const a of existing) artMap.set(String(a.id || a.url || ''), a);
+  for (const a of existing) artMap.set(String(a.id), a);
   for (const a of newArts) { const key = String(a.id); if (key) artMap.set(key, a); }
-
   const allArts = [...artMap.values()];
-  const withContent = allArts.filter(a => a.content).length;
+
+  // Enrich
+  if (!NO_ENRICH) {
+    console.log('\nEnriching article columns/topics (HTML page scrape)...');
+    let enriched = 0;
+    for (const a of allArts) {
+      if (a.column && a.topics.length > 0) continue; // already enriched
+      if (!a.id) continue;
+      const data = await enrichArticle(a.id, cookie, USER_TOKEN);
+      if (data.column) { a.column = data.column; enriched++; }
+      if (data.topics.length > 0) { a.topics = data.topics; }
+      await sleep(500);
+    }
+    console.log(`  Enriched ${enriched}/${allArts.length} articles`);
+  }
+
+  // Download images
+  if (!NO_IMAGES) {
+    console.log('\nDownloading article images...');
+    let imgCount = 0;
+    for (const a of allArts) {
+      if (a.content_html) {
+        const result = await downloadImages(a.content_html, a.id, 'article', OUT_DIR_CLI, CONCURRENCY);
+        a.content_html = result.html;
+        a.images = result.manifest;
+        imgCount += result.manifest.filter(m => !m.failed).length;
+      }
+    }
+    console.log(`  Downloaded ${imgCount} images for ${allArts.length} articles`);
+  }
+
+  const withContent = allArts.filter(a => a.content_html).length;
   saveJSON('zhihu_articles_all.json', allArts);
   console.log(`Articles done: ${allArts.length} total (${withContent} with content, ${upgradedCount} upgraded)`);
   return allArts;
 }
 
-// ─── MAIN ─────────────────────────────────────────────────────────────────────
+// ─── Summary ──────────────────────────────────────────────────────────────────
+function writeSummary(answers, pins, articles, profile) {
+  const aTotal = answers?.total || answers?.answers?.length || 0;
+  const aContent = answers?.answers?.filter?.(a => a.content_html)?.length || 0;
+  const pTotal = pins?.length || 0;
+  const pText = pins?.filter?.(p => p.content_html)?.length || 0;
+  const artTotal = articles?.length || 0;
+  const artContent = articles?.filter?.(a => a.content_html)?.length || 0;
+
+  console.log('\n═══════════════════════════════════════');
+  console.log('   ARCHIVAL COMPLETE');
+  console.log('═══════════════════════════════════════');
+  console.log(`  Answers:  ${aTotal} (${aContent} with content)`);
+  console.log(`  Pins:     ${pTotal} (${pText} with content)`);
+  console.log(`  Articles: ${artTotal} (${artContent} with content)`);
+  console.log('═══════════════════════════════════════');
+
+  const summary = [
+    '# Zhihu Data Archive',
+    '',
+    `Archived: ${new Date().toISOString().split('T')[0]}`,
+    `Target: ${USER_TOKEN}`,
+    profile ? `Name: ${profile.name}` : '',
+    '',
+    '## Summary',
+    '',
+    '| Type | Count | With Content |',
+    '|------|------:|-------------:|',
+    `| Answers | ${aTotal} | ${aContent} |`,
+    `| Pins | ${pTotal} | ${pText} |`,
+    `| Articles | ${artTotal} | ${artContent} |`,
+    '',
+    '## Files',
+    '',
+    '- `zhihu_complete.json` — all answers',
+    '- `zhihu_pins_all.json` — all pins',
+    '- `zhihu_articles_all.json` — all articles',
+    '- `zhihu_references.json` — cross-reference index',
+    NO_IMAGES ? '' : '- `images/` — downloaded images',
+    NO_MARKDOWN ? '' : '- `markdown/` — rendered Markdown files',
+  ].filter(Boolean).join('\n');
+  fs.writeFileSync(`${OUT_DIR_CLI}/zhihu_archive_summary.md`, summary, 'utf8');
+  console.log(`Summary saved to ${OUT_DIR_CLI}/zhihu_archive_summary.md`);
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   console.log('═══════════════════════════════════════');
-  console.log('   ZHIHU COMPREHENSIVE DATA ARCHIVAL');
+  console.log('   ZHIHU DATA ARCHIVAL v2.0.0');
   console.log('   Target: ' + USER_TOKEN);
-  console.log('   Working dir: ' + OUT_DIR);
+  console.log('   Output: ' + OUT_DIR_CLI);
   console.log('═══════════════════════════════════════\n');
 
   const cookie = getCookie();
-  const headers = makeHeaders(cookie);
   console.log(`Cookie: ${cookie.slice(0, 40)}...`);
 
   // Verify
   console.log('Verifying cookie...');
-  const profile = await fetchProfile(headers);
+  const profile = await fetchProfile(USER_TOKEN, cookie);
   console.log(`✓ Logged in as: ${profile.name}`);
   console.log(`  Answers: ${profile.answer_count} | Pins: ${profile.pins_count} | Articles: ${profile.articles_count}\n`);
 
-  // Fetch
   let answers = null, pins = null, articles = null;
 
   if (!SKIP.answers) {
     const t0 = Date.now();
-    answers = await fetchAllAnswers(headers);
+    answers = await fetchAnswers(cookie);
     console.log(`  Time: ${((Date.now()-t0)/1000).toFixed(0)}s\n`);
   } else {
     answers = loadJSON('zhihu_complete.json');
+    if (answers) answers.profile = answers.profile || { name: profile.name, url_token: USER_TOKEN };
     console.log('Skipping answers.\n');
   }
 
   if (!SKIP.pins) {
     const t0 = Date.now();
-    pins = await fetchAllPins(headers);
+    pins = await fetchPins(cookie);
     console.log(`  Time: ${((Date.now()-t0)/1000).toFixed(0)}s\n`);
   } else {
-    pins = loadJSON('zhihu_pins_all.json');
+    pins = loadJSON('zhihu_pins_all.json') || [];
     console.log('Skipping pins.\n');
   }
 
   if (!SKIP.articles) {
     const t0 = Date.now();
-    articles = await fetchAllArticles(headers);
+    articles = await fetchArticles(cookie);
     console.log(`  Time: ${((Date.now()-t0)/1000).toFixed(0)}s\n`);
   } else {
-    articles = loadJSON('zhihu_articles_all.json');
+    articles = loadJSON('zhihu_articles_all.json') || [];
     console.log('Skipping articles.\n');
   }
 
+  // Cross-reference index
+  const refs = buildCrossReferences(answers, pins, articles);
+  saveJSON('zhihu_references.json', refs);
+
+  // Markdown
+  if (!NO_MARKDOWN) {
+    console.log('\nGenerating Markdown...');
+    const mdProfile = { name: profile.name };
+    const answersObj = answers?.answers ? { profile: { ...mdProfile, ...(answers.profile||{}) }, answers: answers.answers, years: answers.years, total: answers.total } : null;
+    await exportMarkdown(answersObj, pins, articles, OUT_DIR_CLI);
+    console.log('  Markdown exported.');
+  }
+
   // Summary
-  const aTotal = answers?.total || answers?.answers?.length || 0;
-  const aContent = answers?.answers?.filter?.(a => a.content)?.length || 0;
-  const pTotal = pins?.length || 0;
-  const pText = pins?.filter?.(p => p.text)?.length || 0;
-  const artTotal = articles?.length || 0;
-  const artContent = articles?.filter?.(a => a.content)?.length || 0;
-
-  console.log('═══════════════════════════════════════');
-  console.log('   ARCHIVAL COMPLETE');
-  console.log('═══════════════════════════════════════');
-  console.log(`  Answers:  ${aTotal} (${aContent} with content)`);
-  console.log(`  Pins:     ${pTotal} (${pText} with text)`);
-  console.log(`  Articles: ${artTotal} (${artContent} with content)`);
-  console.log('═══════════════════════════════════════');
-
-  // Summary file
-  const summary = [
-    `# Zhihu Data Archive`,
-    ``,
-    `Archived: ${new Date().toISOString().split('T')[0]}`,
-    `Target: ${USER_TOKEN}`,
-    ``,
-    `## Summary`,
-    ``,
-    `| Type | Count | With Content |`,
-    `|------|------:|-------------:|`,
-    `| Answers | ${aTotal} | ${aContent} |`,
-    `| Pins | ${pTotal} | ${pText} |`,
-    `| Articles | ${artTotal} | ${artContent} |`,
-    ``,
-    `## Files`,
-    ``,
-    `- \`zhihu_complete.json\` — ${aTotal} answers`,
-    `- \`zhihu_pins_all.json\` — ${pTotal} pins`,
-    `- \`zhihu_articles_all.json\` — ${artTotal} articles`,
-  ].join('\n');
-  fs.writeFileSync(`${OUT_DIR}/zhihu_archive_summary.md`, summary, 'utf8');
-  console.log(`Summary saved to ${OUT_DIR}/zhihu_archive_summary.md`);
+  writeSummary(answers, pins, articles, profile);
 }
 
 main().catch(e => {
   console.error('\nFatal:', e.message);
+  console.error(e.stack);
   console.log('Partial data may have been saved via checkpoints.');
   process.exit(1);
 });
