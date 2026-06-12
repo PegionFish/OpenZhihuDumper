@@ -1,0 +1,37 @@
+# Credentials — never commit
+zhihu_cookie_header.txt
+*.cookie
+cookies*.json
+cookies*.txt
+*_cookies_*.json
+*_cookies_*.txt
+*.db
+
+# Scraped data — large files, may contain personal info
+zhihu_complete.json
+zhihu_pins_all.json
+zhihu_articles_all.json
+zhihu_followees_all.json
+zhihu_topics_all.json
+zhihu_archive_summary.md
+zhiku_profile*.json
+
+# Checkpoint files
+*_ckpt.json
+*.ckpt
+
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# System
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
