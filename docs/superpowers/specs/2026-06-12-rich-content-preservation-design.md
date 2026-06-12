@@ -253,6 +253,30 @@ Fallback: if the page returns a 403/captcha, skip enrichment silently and leave 
 
 cheerio scans all `<img>` tags. Priority for src: `data-actualsrc` > `data-original` > `src`.
 
+### Original Resolution ("原图")
+
+Zhihu serves thumbnails by default. The true original image is obtained by stripping size suffixes and path prefixes from the URL:
+
+**Size suffixes to remove** (between hash and extension):
+`_qhd`, `_720w`, `_480w`, `_280w`, `_b`, `_r`, `_hd`, `_xl`, `_l`, `_m`, `_s`, `_t`
+
+**Thumbnail path prefix to remove**: `/50/` (e.g., `pic4.zhimg.com/50/v2-xxx_l.jpg` → `pic4.zhimg.com/v2-xxx.jpg`)
+
+**Tracking params to strip**: `?source=...`
+
+**Resolution logic** (`resolveOriginalUrl`):
+```
+Input:  https://pic3.zhimg.com/50/v2-d706321_qhd.jpg?source=e3d01f54
+Step 1: Strip query params    → https://pic3.zhimg.com/50/v2-d706321_qhd.jpg
+Step 2: Remove /50/ prefix    → https://pic3.zhimg.com/v2-d706321_qhd.jpg
+Step 3: Remove size suffix    → https://pic3.zhimg.com/v2-d706321.jpg
+Result: https://pic3.zhimg.com/v2-d706321.jpg
+```
+
+**Fallback**: If the resolved original URL returns HTTP 404, try the original (thumbnail) URL. Some legacy images may not have a suffix-free version.
+
+Verified: `_l.jpg` → suffix removal → 78% larger file (4039 vs 2269 bytes).
+
 ### Download Rules
 
 - Concurrency: max 5 simultaneous downloads via `Promise.allSettled`
@@ -262,11 +286,11 @@ cheerio scans all `<img>` tags. Priority for src: `data-actualsrc` > `data-origi
 
 ### Path Rewriting
 
-| Original | After |
-|----------|-------|
-| `https://picx.zhimg.com/v2-abc123_xl.jpg?source=xxx` | `images/answer_3275770022/v2-abc123_xl.jpg` |
+| Original | After resolution | Local path |
+|----------|-----------------|------------|
+| `https://picx.zhimg.com/v2-abc123_xl.jpg?source=xxx` | `https://picx.zhimg.com/v2-abc123.jpg` | `images/answer_3275770022/v2-abc123.jpg` |
 
-The `src` attribute is rewritten to a relative path. Original URL is preserved in the `images` manifest array on the JSON object.
+The `src` attribute is rewritten to a relative local path. Original URL is preserved in the `images` manifest array.
 
 ### Output Layout
 
@@ -274,11 +298,11 @@ The `src` attribute is rewritten to a relative path. Original URL is preserved i
 outDir/
   images/
     answer_3275770022/
-      v2-abc123_xl.jpg
+      v2-abc123.jpg
     article_721098598/
-      v2-def456_r.jpg
+      v2-def456.jpg
     pins/
-      v2-ghi789_l.jpg
+      v2-ghi789.jpg
 ```
 
 ## Markdown Export
