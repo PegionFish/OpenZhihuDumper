@@ -1,0 +1,24 @@
+{
+  "name": "open-zhihu-dumper",
+  "version": "2.0.0",
+  "description": "Dump your personal Zhihu account data with rich content preservation (emoji, images, repost chains, topics)",
+  "type": "module",
+  "main": "fetch_zhihu.mjs",
+  "scripts": {
+    "start": "node fetch_zhihu.mjs"
+  },
+  "keywords": ["zhihu", "archival", "data-portability", "scraper"],
+  "author": "PegionFish <boblao0714@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PegionFish/OpenZhihuDumper"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "turndown": "^7.2.4"
+  }
+}

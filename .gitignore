@@ -30,6 +30,16 @@ yarn.lock
 Thumbs.db
 desktop.ini
 
+# Dependencies
+node_modules/
+package-lock.json
+
+# Downloaded images
+images/
+
+# Markdown output
+markdown/
+
 # IDE
 .vscode/
 .idea/
