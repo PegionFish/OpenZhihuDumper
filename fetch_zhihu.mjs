@@ -136,7 +136,22 @@ async function fetchAnswers(cookie, profile) {
 
   const existing = loadJSON('zhihu_complete.json', OUT_DIR_CLI);
   const existingMap = new Map();
-  for (const a of (existing?.answers || [])) existingMap.set(a.id, a);
+  for (const a of (existing?.answers || [])) {
+    if (!a) continue;
+    // Legacy archives stored `question` as just the title string.
+    if (typeof a.question === 'string') {
+      a.question = {
+        id: '', url: '', title: a.question,
+        detail: '', detail_text: '', topics: [], created: '',
+      };
+    } else if (!a.question) {
+      a.question = {
+        id: '', url: '', title: '',
+        detail: '', detail_text: '', topics: [], created: '',
+      };
+    }
+    existingMap.set(String(a.id || ''), a);
+  }
   console.log(`Existing: ${existingMap.size} answers (${[...existingMap.values()].filter(a => a.content_html).length} with content)`);
 
   const existingIds = new Set(existingMap.keys());
