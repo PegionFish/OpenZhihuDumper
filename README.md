@@ -201,6 +201,9 @@ node fetch_zhihu.mjs --token=some-user --skip-pins --cookie="z_c0=..."
 
 ## 已知限制
 
+- **回答/文章计数字段变更**：知乎 API v4 的 `/members/{token}/answers` 和 `/members/{token}/articles` 端点已不直接返回 `voteup_count`/`comment_count`/`collect_count`，改为在 `reaction.statistics` 中返回 `like_count`（对应赞同）和 `favorites`（对应收藏）。脚本会自动读取新字段，但**评论数目前无法获取**，会显示为 0。
+- **关注者数量不可见**：`/members/{token}` 端点目前返回 `followers_count: null`，因此 `profile.follower_count` 会显示为 0。
+- **HTML 补充抓取受限**：问题详情/话题/专栏的 HTML 页面补充抓取现在会触发知乎 WBI/x-zse-96 验证页，导致 `--no-enrich` 以外的 enrichment 数据为空。
 - **回答深分页 500**：翻到 ~2,000 条回答后知乎服务端报错，脚本会优雅停止并保存已有数据
 - **赞同历史不可访问**：`/members/{token}/vote-up` 端点在 API v4 中对非本人返回 403，需要 CDP 浏览器方案
 - **Cookie 过期**：需要定期重新提取
