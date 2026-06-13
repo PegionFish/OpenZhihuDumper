@@ -129,12 +129,12 @@ function buildCrossReferences(answers, pins, articles) {
 }
 
 // ─── Answers ──────────────────────────────────────────────────────────────────
-async function fetchAnswers(cookie) {
+async function fetchAnswers(cookie, profile) {
   console.log('\n═══════════════════════════════════════');
   console.log('   FETCHING ANSWERS');
   console.log('═══════════════════════════════════════');
 
-  const existing = loadJSON('zhihu_complete.json');
+  const existing = loadJSON('zhihu_complete.json', OUT_DIR_CLI);
   const existingMap = new Map();
   for (const a of (existing?.answers || [])) existingMap.set(a.id, a);
   console.log(`Existing: ${existingMap.size} answers (${[...existingMap.values()].filter(a => a.content_html).length} with content)`);
@@ -153,7 +153,7 @@ async function fetchAnswers(cookie) {
     onCheckpoint: (items) => {
       const merged = new Map(existingMap);
       for (const a of items) merged.set(a.id, a);
-      finalizeAnswers(merged, 0);
+      finalizeAnswers(merged, 0, profile);
     },
   });
 
@@ -204,10 +204,10 @@ async function fetchAnswers(cookie) {
     console.log(`  Downloaded ${imgCount} images for ${total} answers`);
   }
 
-  return finalizeAnswers(existingMap, upgradedCount);
+  return finalizeAnswers(existingMap, upgradedCount, profile);
 }
 
-function finalizeAnswers(answerMap, upgradedCount) {
+function finalizeAnswers(answerMap, upgradedCount, profile) {
   const answers = [...answerMap.values()].sort(
     (a, b) => new Date(a.created || 0) - new Date(b.created || 0)
   );
@@ -219,8 +219,21 @@ function finalizeAnswers(answerMap, upgradedCount) {
   const totalVotes = answers.reduce((s, a) => s + (a.voteup_count || 0), 0);
   const withContent = answers.filter(a => a.content_html).length;
 
-  const result = { total: answers.length, total_votes: totalVotes, years, answers };
-  saveJSON('zhihu_complete.json', result);
+  const result = {
+    profile: profile ? {
+      name: profile.name || '',
+      url_token: profile.url_token || USER_TOKEN,
+      answer_count: profile.answer_count ?? 0,
+      pins_count: profile.pins_count ?? 0,
+      articles_count: profile.articles_count ?? 0,
+      follower_count: profile.follower_count ?? 0,
+    } : undefined,
+    total: answers.length,
+    total_votes: totalVotes,
+    years,
+    answers,
+  };
+  saveJSON('zhihu_complete.json', result, OUT_DIR_CLI);
   const yStr = Object.entries(years).sort(([a],[b])=>a-b).map(([y,c])=>`${y}:${c}`).join(', ');
   console.log(`Answers done: ${answers.length} total (${withContent} with content) [${yStr}]`);
   if (upgradedCount) console.log(`  (${upgradedCount} existing entries upgraded)`);
@@ -233,7 +246,7 @@ async function fetchPins(cookie) {
   console.log('   FETCHING PINS (想法)');
   console.log('═══════════════════════════════════════');
 
-  const existing = loadJSON('zhihu_pins_all.json') || [];
+  const existing = loadJSON('zhihu_pins_all.json', OUT_DIR_CLI) || [];
   console.log(`Existing: ${existing.length} pins`);
   const existingUrls = new Set(existing.filter(p => p.url).map(p => p.url));
 
@@ -274,7 +287,7 @@ async function fetchPins(cookie) {
 
   const withText = allPins.filter(p => p.content_html).length;
   const newCount = allPins.filter(p => !existingUrls.has(p.url)).length;
-  saveJSON('zhihu_pins_all.json', allPins);
+  saveJSON('zhihu_pins_all.json', allPins, OUT_DIR_CLI);
   console.log(`Pins done: ${allPins.length} total (+${newCount} new, ${withText} with content)`);
   return allPins;
 }
@@ -285,7 +298,7 @@ async function fetchArticles(cookie) {
   console.log('   FETCHING ARTICLES');
   console.log('═══════════════════════════════════════');
 
-  const existing = loadJSON('zhihu_articles_all.json') || [];
+  const existing = loadJSON('zhihu_articles_all.json', OUT_DIR_CLI) || [];
   console.log(`Existing: ${existing.length} articles`);
   const existingIds = new Set(existing.filter(a => a.id).map(a => String(a.id)));
   let upgradedCount = 0;
@@ -332,12 +345,22 @@ async function fetchArticles(cookie) {
         a.images = result.manifest;
         imgCount += result.manifest.filter(m => !m.failed).length;
       }
+      // Cover image
+      if (a.image_url) {
+        const result = await downloadImages(`<img src="${a.image_url}">`, a.id, 'article', OUT_DIR_CLI, CONCURRENCY);
+        if (result.manifest.length > 0 && !result.manifest[0].failed) {
+          a.image_url = result.manifest[0].local;
+          a.images = a.images || [];
+          a.images.push(result.manifest[0]);
+          imgCount++;
+        }
+      }
     }
     console.log(`  Downloaded ${imgCount} images for ${allArts.length} articles`);
   }
 
   const withContent = allArts.filter(a => a.content_html).length;
-  saveJSON('zhihu_articles_all.json', allArts);
+  saveJSON('zhihu_articles_all.json', allArts, OUT_DIR_CLI);
   console.log(`Articles done: ${allArts.length} total (${withContent} with content, ${upgradedCount} upgraded)`);
   return allArts;
 }
@@ -398,6 +421,9 @@ async function main() {
   const cookie = getCookie();
   console.log(`Cookie: ${cookie.slice(0, 40)}...`);
 
+  // Ensure output directory exists
+  fs.mkdirSync(OUT_DIR_CLI, { recursive: true });
+
   // Verify
   console.log('Verifying cookie...');
   const profile = await fetchProfile(USER_TOKEN, cookie);
@@ -408,11 +434,15 @@ async function main() {
 
   if (!SKIP.answers) {
     const t0 = Date.now();
-    answers = await fetchAnswers(cookie);
+    answers = await fetchAnswers(cookie, profile);
     console.log(`  Time: ${((Date.now()-t0)/1000).toFixed(0)}s\n`);
   } else {
-    answers = loadJSON('zhihu_complete.json');
-    if (answers) answers.profile = answers.profile || { name: profile.name, url_token: USER_TOKEN };
+    answers = loadJSON('zhihu_complete.json', OUT_DIR_CLI);
+    if (answers) answers.profile = answers.profile || {
+      name: profile.name, url_token: USER_TOKEN,
+      answer_count: profile.answer_count, pins_count: profile.pins_count,
+      articles_count: profile.articles_count, follower_count: profile.follower_count,
+    };
     console.log('Skipping answers.\n');
   }
 
@@ -421,7 +451,7 @@ async function main() {
     pins = await fetchPins(cookie);
     console.log(`  Time: ${((Date.now()-t0)/1000).toFixed(0)}s\n`);
   } else {
-    pins = loadJSON('zhihu_pins_all.json') || [];
+    pins = loadJSON('zhihu_pins_all.json', OUT_DIR_CLI) || [];
     console.log('Skipping pins.\n');
   }
 
@@ -430,13 +460,13 @@ async function main() {
     articles = await fetchArticles(cookie);
     console.log(`  Time: ${((Date.now()-t0)/1000).toFixed(0)}s\n`);
   } else {
-    articles = loadJSON('zhihu_articles_all.json') || [];
+    articles = loadJSON('zhihu_articles_all.json', OUT_DIR_CLI) || [];
     console.log('Skipping articles.\n');
   }
 
   // Cross-reference index
   const refs = buildCrossReferences(answers, pins, articles);
-  saveJSON('zhihu_references.json', refs);
+  saveJSON('zhihu_references.json', refs, OUT_DIR_CLI);
 
   // Markdown
   if (!NO_MARKDOWN) {
