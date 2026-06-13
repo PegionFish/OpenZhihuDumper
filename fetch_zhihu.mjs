@@ -16,6 +16,7 @@
 //   --concurrency=<n>        Image download concurrency (default: 5)
 
 import fs from 'fs';
+import path from 'path';
 import {
   OUT_DIR, API, CKPT_INTERVAL,
 } from './lib/constants.mjs';
@@ -31,7 +32,7 @@ import {
 import {
   getArticlesInclude, extractArticle, mergeArticle,
 } from './lib/extractors/articles.mjs';
-import { downloadImages } from './lib/media.mjs';
+import { downloadImages, createImageLogger } from './lib/media.mjs';
 import { exportMarkdown } from './lib/exporter.mjs';
 import { enrichQuestion, enrichArticle } from './lib/enricher.mjs';
 
@@ -128,6 +129,47 @@ function buildCrossReferences(answers, pins, articles) {
   return refs;
 }
 
+function timestampForFilename() {
+  return new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+}
+
+function writeImageLogs(imageLogs, outDir) {
+  if (!imageLogs.length) return;
+  const logsDir = path.join(outDir, 'logs');
+  fs.mkdirSync(logsDir, { recursive: true });
+  const ts = timestampForFilename();
+
+  const fullLog = imageLogs.map(item => ({
+    itemType: item.itemType,
+    itemId: item.itemId,
+    total: item.total,
+    success: item.success,
+    skipped: item.skipped,
+    fallback: item.fallback,
+    failed: item.failed,
+    images: item.images.map(img => ({
+      url: img.full_resolution || img.original,
+      status: img.failed ? 'failed' : img.fallback ? 'fallback' : img.skipped ? 'skipped' : 'success',
+      local: img.local || null,
+      error: img.failed ? 'download failed' : undefined,
+    })),
+  }));
+
+  fs.writeFileSync(path.join(logsDir, `image_download_${ts}.json`), JSON.stringify(fullLog, null, 2), 'utf8');
+
+  const failedList = imageLogs.flatMap(item =>
+    item.images
+      .filter(img => img.failed)
+      .map(img => ({
+        itemType: item.itemType,
+        itemId: item.itemId,
+        url: img.full_resolution || img.original,
+      }))
+  );
+
+  fs.writeFileSync(path.join(logsDir, `images_failed_${ts}.json`), JSON.stringify(failedList, null, 2), 'utf8');
+}
+
 // ─── Answers ──────────────────────────────────────────────────────────────────
 async function fetchAnswers(cookie, profile) {
   console.log('\n═══════════════════════════════════════');
@@ -204,22 +246,32 @@ async function fetchAnswers(cookie, profile) {
   }
 
   // Download images
+  const imageLogs = [];
   if (!NO_IMAGES) {
     console.log('\nDownloading answer images...');
-    let imgCount = 0, total = 0;
+    let imgCount = 0, skipCount = 0, fallbackCount = 0, failCount = 0, total = 0;
     for (const a of existingMap.values()) {
       if (a.content_html) {
         total++;
-        const result = await downloadImages(a.content_html, a.id, 'answer', OUT_DIR_CLI, CONCURRENCY);
+        const result = await downloadImages(a.content_html, a.id, 'answer', OUT_DIR_CLI, CONCURRENCY, createImageLogger('answer', a.id));
         a.content_html = result.html;
         a.images = result.manifest;
-        imgCount += result.manifest.filter(m => !m.failed).length;
+        const success = result.manifest.filter(m => !m.failed && !m.fallback && !m.skipped).length;
+        const skipped = result.manifest.filter(m => m.skipped).length;
+        const fallback = result.manifest.filter(m => m.fallback).length;
+        const failed = result.manifest.filter(m => m.failed).length;
+        imgCount += success;
+        skipCount += skipped;
+        fallbackCount += fallback;
+        failCount += failed;
+        imageLogs.push({ itemType: 'answer', itemId: a.id, total: result.manifest.length, success, skipped, fallback, failed, images: result.manifest });
       }
     }
-    console.log(`  Downloaded ${imgCount} images for ${total} answers`);
+    console.log(`  图片：${imgCount} 下载成功，${skipCount} 跳过，${fallbackCount} 降级，${failCount} 失败（共 ${imgCount + skipCount + fallbackCount + failCount} 张）`);
   }
 
-  return finalizeAnswers(existingMap, upgradedCount, profile);
+  const result = finalizeAnswers(existingMap, upgradedCount, profile);
+  return { ...result, imageLogs };
 }
 
 function finalizeAnswers(answerMap, upgradedCount, profile) {
@@ -279,32 +331,50 @@ async function fetchPins(cookie) {
   const allPins = [...pinMap.values()].sort((a, b) => (b.created || '').localeCompare(a.created || ''));
 
   // Download images
+  const imageLogs = [];
   if (!NO_IMAGES) {
     console.log('\nDownloading pin images...');
-    let imgCount = 0;
+    let imgCount = 0, skipCount = 0, fallbackCount = 0, failCount = 0;
     for (const p of allPins) {
       if (p.content_html) {
-        const result = await downloadImages(p.content_html, p.id, 'pin', OUT_DIR_CLI, CONCURRENCY);
+        const result = await downloadImages(p.content_html, p.id, 'pin', OUT_DIR_CLI, CONCURRENCY, createImageLogger('pin', p.id));
         p.content_html = result.html;
         p.images = result.manifest;
-        imgCount += result.manifest.filter(m => !m.failed).length;
+        const success = result.manifest.filter(m => !m.failed && !m.fallback && !m.skipped).length;
+        const skipped = result.manifest.filter(m => m.skipped).length;
+        const fallback = result.manifest.filter(m => m.fallback).length;
+        const failed = result.manifest.filter(m => m.failed).length;
+        imgCount += success;
+        skipCount += skipped;
+        fallbackCount += fallback;
+        failCount += failed;
+        imageLogs.push({ itemType: 'pin', itemId: p.id, total: result.manifest.length, success, skipped, fallback, failed, images: result.manifest });
       }
       // Also download images in repin/origin_pin chains
       for (const key of ['repin', 'origin_pin']) {
         if (p[key]?.content_html) {
-          const result = await downloadImages(p[key].content_html, `${p.id}_${key}`, 'pin', OUT_DIR_CLI, CONCURRENCY);
+          const result = await downloadImages(p[key].content_html, `${p.id}_${key}`, 'pin', OUT_DIR_CLI, CONCURRENCY, createImageLogger('pin', `${p.id}_${key}`));
           p[key].content_html = result.html;
+          const success = result.manifest.filter(m => !m.failed && !m.fallback && !m.skipped).length;
+          const skipped = result.manifest.filter(m => m.skipped).length;
+          const fallback = result.manifest.filter(m => m.fallback).length;
+          const failed = result.manifest.filter(m => m.failed).length;
+          imgCount += success;
+          skipCount += skipped;
+          fallbackCount += fallback;
+          failCount += failed;
+          imageLogs.push({ itemType: 'pin', itemId: `${p.id}_${key}`, total: result.manifest.length, success, skipped, fallback, failed, images: result.manifest });
         }
       }
     }
-    console.log(`  Downloaded ${imgCount} images for ${allPins.length} pins`);
+    console.log(`  图片：${imgCount} 下载成功，${skipCount} 跳过，${fallbackCount} 降级，${failCount} 失败（共 ${imgCount + skipCount + fallbackCount + failCount} 张）`);
   }
 
   const withText = allPins.filter(p => p.content_html).length;
   const newCount = allPins.filter(p => !existingUrls.has(p.url)).length;
   saveJSON('zhihu_pins_all.json', allPins, OUT_DIR_CLI);
   console.log(`Pins done: ${allPins.length} total (+${newCount} new, ${withText} with content)`);
-  return allPins;
+  return { pins: allPins, imageLogs };
 }
 
 // ─── Articles ─────────────────────────────────────────────────────────────────
@@ -350,34 +420,47 @@ async function fetchArticles(cookie) {
   }
 
   // Download images
+  const imageLogs = [];
   if (!NO_IMAGES) {
     console.log('\nDownloading article images...');
-    let imgCount = 0;
+    let imgCount = 0, skipCount = 0, fallbackCount = 0, failCount = 0;
     for (const a of allArts) {
       if (a.content_html) {
-        const result = await downloadImages(a.content_html, a.id, 'article', OUT_DIR_CLI, CONCURRENCY);
+        const result = await downloadImages(a.content_html, a.id, 'article', OUT_DIR_CLI, CONCURRENCY, createImageLogger('article', a.id));
         a.content_html = result.html;
         a.images = result.manifest;
-        imgCount += result.manifest.filter(m => !m.failed).length;
+        const success = result.manifest.filter(m => !m.failed && !m.fallback && !m.skipped).length;
+        const skipped = result.manifest.filter(m => m.skipped).length;
+        const fallback = result.manifest.filter(m => m.fallback).length;
+        const failed = result.manifest.filter(m => m.failed).length;
+        imgCount += success;
+        skipCount += skipped;
+        fallbackCount += fallback;
+        failCount += failed;
+        imageLogs.push({ itemType: 'article', itemId: a.id, total: result.manifest.length, success, skipped, fallback, failed, images: result.manifest });
       }
       // Cover image
       if (a.image_url) {
-        const result = await downloadImages(`<img src="${a.image_url}">`, a.id, 'article', OUT_DIR_CLI, CONCURRENCY);
+        const result = await downloadImages(`<img src="${a.image_url}">`, a.id, 'article', OUT_DIR_CLI, CONCURRENCY, createImageLogger('article', `${a.id}_cover`));
         if (result.manifest.length > 0 && !result.manifest[0].failed) {
           a.image_url = result.manifest[0].local;
           a.images = a.images || [];
           a.images.push(result.manifest[0]);
           imgCount++;
+          imageLogs.push({ itemType: 'article', itemId: `${a.id}_cover`, total: 1, success: 1, skipped: 0, fallback: 0, failed: 0, images: result.manifest });
+        } else if (result.manifest.length > 0 && result.manifest[0].failed) {
+          failCount++;
+          imageLogs.push({ itemType: 'article', itemId: `${a.id}_cover`, total: 1, success: 0, skipped: 0, fallback: 0, failed: 1, images: result.manifest });
         }
       }
     }
-    console.log(`  Downloaded ${imgCount} images for ${allArts.length} articles`);
+    console.log(`  图片：${imgCount} 下载成功，${skipCount} 跳过，${fallbackCount} 降级，${failCount} 失败（共 ${imgCount + skipCount + fallbackCount + failCount} 张）`);
   }
 
   const withContent = allArts.filter(a => a.content_html).length;
   saveJSON('zhihu_articles_all.json', allArts, OUT_DIR_CLI);
   console.log(`Articles done: ${allArts.length} total (${withContent} with content, ${upgradedCount} upgraded)`);
-  return allArts;
+  return { articles: allArts, imageLogs };
 }
 
 // ─── Summary ──────────────────────────────────────────────────────────────────
@@ -446,10 +529,13 @@ async function main() {
   console.log(`  Answers: ${profile.answer_count} | Pins: ${profile.pins_count} | Articles: ${profile.articles_count}\n`);
 
   let answers = null, pins = null, articles = null;
+  let answerLogs = [], pinLogs = [], articleLogs = [];
 
   if (!SKIP.answers) {
     const t0 = Date.now();
-    answers = await fetchAnswers(cookie, profile);
+    const answerResult = await fetchAnswers(cookie, profile);
+    answers = answerResult;
+    answerLogs = answerResult.imageLogs || [];
     console.log(`  Time: ${((Date.now()-t0)/1000).toFixed(0)}s\n`);
   } else {
     answers = loadJSON('zhihu_complete.json', OUT_DIR_CLI);
@@ -463,7 +549,9 @@ async function main() {
 
   if (!SKIP.pins) {
     const t0 = Date.now();
-    pins = await fetchPins(cookie);
+    const pinResult = await fetchPins(cookie);
+    pins = pinResult.pins;
+    pinLogs = pinResult.imageLogs || [];
     console.log(`  Time: ${((Date.now()-t0)/1000).toFixed(0)}s\n`);
   } else {
     pins = loadJSON('zhihu_pins_all.json', OUT_DIR_CLI) || [];
@@ -472,7 +560,9 @@ async function main() {
 
   if (!SKIP.articles) {
     const t0 = Date.now();
-    articles = await fetchArticles(cookie);
+    const articleResult = await fetchArticles(cookie);
+    articles = articleResult.articles;
+    articleLogs = articleResult.imageLogs || [];
     console.log(`  Time: ${((Date.now()-t0)/1000).toFixed(0)}s\n`);
   } else {
     articles = loadJSON('zhihu_articles_all.json', OUT_DIR_CLI) || [];
@@ -482,6 +572,9 @@ async function main() {
   // Cross-reference index
   const refs = buildCrossReferences(answers, pins, articles);
   saveJSON('zhihu_references.json', refs, OUT_DIR_CLI);
+
+  // Persist image download logs
+  writeImageLogs([...answerLogs, ...pinLogs, ...articleLogs], OUT_DIR_CLI);
 
   // Markdown
   if (!NO_MARKDOWN) {
