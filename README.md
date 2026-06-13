@@ -130,17 +130,19 @@ node fetch_zhihu.mjs --token=some-user --skip-pins --cookie="z_c0=..."
   "answers": [
     {
       "id": "3275770022",
+      "url": "https://www.zhihu.com/answer/3275770022",
       "question": {
         "id": "2047291016621958122",
+        "url": "https://www.zhihu.com/question/2047291016621958122",
         "title": "如何看待...？",
-        "detail": "<p>问题补充描述 HTML</p>",
-        "detail_text": "纯文本",
-        "topics": [{"id": "xxx", "name": "科技"}],
+        "detail": "",
+        "detail_text": "",
+        "topics": [],
         "created": "2025-06-01T..."
       },
       "content_html": "<p>回答正文，图片本地路径...</p>",
       "voteup_count": 174,
-      "comment_count": 123,
+      "comment_count": 0,
       "collect_count": 77,
       "created": "2023-11-03T13:02:32.000Z",
       "images": [
@@ -157,20 +159,20 @@ node fetch_zhihu.mjs --token=some-user --skip-pins --cookie="z_c0=..."
   {
     "id": "2043771335239807347",
     "type": "pin",
-    "url": "/pins/2043771335239807347",
+    "url": "https://www.zhihu.com/pins/2043771335239807347",
     "created": "2026-05-29T...",
     "content_html": "<p>文本+<img class='content-emoji' src='images/pins/emoji_01.png'>...</p>",
     "excerpt_title": "...",
     "repin": {
       "author": {"name": "...", "url_token": "...", "avatar_url": "..."},
       "content_html": "...",
-      "url": "/pins/xxx",
+      "url": "https://www.zhihu.com/pins/xxx",
       "created": "2026-05-28T..."
     },
     "origin_pin": {
       "author": {"name": "...", "url_token": "...", "avatar_url": "..."},
       "content_html": "...",
-      "url": "/pins/xxx",
+      "url": "https://www.zhihu.com/pins/xxx",
       "created": "2026-05-27T..."
     },
     "like_count": 2,
